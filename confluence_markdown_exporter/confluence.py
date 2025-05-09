@@ -21,6 +21,7 @@ from atlassian import Confluence as ConfluenceApi
 from atlassian import Jira
 from atlassian.errors import ApiError
 from bs4 import BeautifulSoup
+from bs4 import NavigableString
 from bs4 import Tag
 from markdownify import ATX
 from markdownify import MarkdownConverter
@@ -89,10 +90,10 @@ class ConverterSettings(BaseSettings):
         ),
     )
     attachment_path: str = Field(
-        default="{space_name}/attachments/{attachment_file_id}{attachment_extension}",
+        default="{space_name}/attachments/{attachment_id}-{attachment_title}",
         description=(
             "Path to store attachments. Default: \n"
-            "  {space_name}/attachments/{attachment_file_id}{attachment_extension}\n"
+            "  {space_name}/attachments/{attachment_id}-{attachment_title}\n"
             "Variables:\n"
             "  {space_key}           - Space key\n"
             "  {space_name}          - Space name\n"
@@ -365,9 +366,12 @@ class Page(Document):
 
     @property
     def descendants(self) -> list[int]:
-        url = f"rest/api/content/{self.id}/descendant/page"
+        # Use CQL search instead of descendant endpoint due to a bug in Confluence 8.5.20
+        # that causes HTTP 500 errors when using the descendant endpoint
+        url = "rest/api/search"
+        cql_query = f"ancestor={self.id} AND type=page"
         try:
-            response = cast(JsonResponse, confluence.get(url, params={"limit": 10000}))
+            response = cast(JsonResponse, confluence.get(url, params={"cql": cql_query, "limit": 10000}))
         except HTTPError as e:
             if e.response.status_code == 404:  # noqa: PLR2004
                 # Raise ApiError as the documented reason is ambiguous
@@ -379,7 +383,8 @@ class Page(Document):
 
             raise
 
-        return [page.get("id") for page in response.get("results", [])]
+        # The search API returns results with a different structure than the descendant endpoint
+        return [page.get("content", {}).get("id") for page in response.get("results", [])]
 
     @property
     def _template_vars(self) -> dict[str, str]:
@@ -461,6 +466,9 @@ class Page(Document):
             if attachment.file_id in self.body:
                 attachment.export(export_path)
                 continue
+
+    def get_attachment_by_id(self, id: str) -> Attachment:
+        return next(attachment for attachment in self.attachments if attachment.id == id)
 
     def get_attachment_by_file_id(self, file_id: str) -> Attachment:
         return next(attachment for attachment in self.attachments if attachment.file_id == file_id)
@@ -739,19 +747,22 @@ class Page(Document):
             if "page" in str(el.get("data-linked-resource-type")):
                 page_id = str(el.get("data-linked-resource-id", ""))
                 if page_id and page_id != "null":
-                    return self.convert_page_link(int(page_id))
+                    return self.convert_page_link(int(page_id), el)
             if "attachment" in str(el.get("data-linked-resource-type")):
                 return self.convert_attachment_link(el, text, parent_tags)
             if match := re.search(r"/wiki/.+?/pages/(\d+)", str(el.get("href", ""))):
                 page_id = match.group(1)
-                return self.convert_page_link(int(page_id))
+                return self.convert_page_link(int(page_id), el)
+            if match := re.search(r"/pages/viewpage.action\?pageId=(\d+)", str(el.get("href", ""))):
+                page_id = match.group(1)
+                return self.convert_page_link(int(page_id), el)
             if str(el.get("href", "")).startswith("#"):
                 # Handle heading links
                 return f"[{text}](#{sanitize_key(text, '-')})"
 
             return super().convert_a(el, text, parent_tags)
 
-        def convert_page_link(self, page_id: int) -> str:
+        def convert_page_link(self, page_id: int, el: BeautifulSoup = None) -> str:
             if not page_id:
                 msg = "Page link does not have valid page_id."
                 raise ValueError(msg)
@@ -759,7 +770,19 @@ class Page(Document):
             page = Page.from_id(page_id)
             relpath = os.path.relpath(page.export_path, self.page.export_path.parent)
 
-            return f"[{page.title}]({relpath.replace(' ', '%20')})"
+            link_content = page.title
+            if el is not None:
+                children = list(el.children)
+                if children:
+                    # Check if first child is a NavigableString (text node)
+                    if isinstance(children[0], NavigableString):
+                        link_content = children[0]
+                    else:
+                        link_content = self.process_tag(children[0], ["a"])
+                else:
+                    link_content = el.string
+
+            return f"[{link_content}]({relpath.replace(' ', '%20')})"
 
         def convert_attachment_link(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
@@ -791,10 +814,18 @@ class Page(Document):
 
         def convert_img(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             file_id = el.get("data-media-id")
-            if not file_id:
-                return ""
+            if file_id:
+                attachment = self.page.get_attachment_by_file_id(str(file_id))
+            else:
+                id = el.get("data-linked-resource-id")
+                container_id = el.get("data-linked-resource-container-id")
+                if not id or not container_id:
+                    return ""
+                image_container_page = Page.from_id(str(container_id))
+                if not image_container_page:
+                    return ""
+                attachment = image_container_page.get_attachment_by_id(str(id))
 
-            attachment = self.page.get_attachment_by_file_id(str(file_id))
             relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
             el["src"] = relpath.replace(" ", "%20")
             if "_inline" in parent_tags:
