@@ -90,10 +90,10 @@ class ConverterSettings(BaseSettings):
         ),
     )
     attachment_path: str = Field(
-        default="{space_name}/attachments/{attachment_id}-{attachment_title}{attachment_extension}",
+        default="{space_name}/attachments/{attachment_id}-{attachment_title}",
         description=(
             "Path to store attachments. Default: \n"
-            "  {space_name}/attachments/{attachment_id}-{attachment_title}{attachment_extension}\n"
+            "  {space_name}/attachments/{attachment_id}-{attachment_title}\n"
             "Variables:\n"
             "  {space_key}           - Space key\n"
             "  {space_name}          - Space name\n"
@@ -467,9 +467,11 @@ class Page(Document):
                 attachment.export(export_path)
                 continue
 
-
-    def get_attachment_by_file_id(self, id: str) -> Attachment:
+    def get_attachment_by_id(self, id: str) -> Attachment:
         return next(attachment for attachment in self.attachments if attachment.id == id)
+
+    def get_attachment_by_file_id(self, file_id: str) -> Attachment:
+        return next(attachment for attachment in self.attachments if attachment.file_id == file_id)
 
     def get_attachments_by_title(self, title: str) -> list[Attachment]:
         return [attachment for attachment in self.attachments if attachment.title == title]
@@ -816,8 +818,13 @@ class Page(Document):
                 attachment = self.page.get_attachment_by_file_id(str(file_id))
             else:
                 id = el.get("data-linked-resource-id")
-                attachment = self.page.get_attachment_by_file_id(str(id))
-                return ""
+                container_id = el.get("data-linked-resource-container-id")
+                if not id or not container_id:
+                    return ""
+                image_container_page = Page.from_id(str(container_id))
+                if not image_container_page:
+                    return ""
+                attachment = image_container_page.get_attachment_by_id(str(id))
 
             relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
             el["src"] = relpath.replace(" ", "%20")
