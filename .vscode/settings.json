@@ -70,7 +70,6 @@
   "markdown.updateLinksOnFileMove.enabled": "prompt",
   "markdown.validate.enabled": true,
   "window.commandCenter": true,
-  "workbench.colorTheme": "Default Light Modern",
   "workbench.editor.empty.hint": "hidden",
   "workbench.startupEditor": "none",
   // open files as tabs
