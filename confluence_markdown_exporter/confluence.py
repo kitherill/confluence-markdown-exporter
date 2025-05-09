@@ -109,7 +109,7 @@ class ConverterSettings(BaseSettings):
 
 
 try:
-    api_settings = ApiSettings()  # type: ignore reportCallIssue as the parameters are read via env file
+api_settings = ApiSettings()  # type: ignore reportCallIssue as the parameters are read via env file
 except ValidationError:
     print(
         "Please set the required environment variables: "
