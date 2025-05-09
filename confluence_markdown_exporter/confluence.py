@@ -109,7 +109,7 @@ class ConverterSettings(BaseSettings):
 
 
 try:
-    api_settings = ApiSettings()  # type: ignore reportCallIssue as the parameters are read via env file
+api_settings = ApiSettings()  # type: ignore reportCallIssue as the parameters are read via env file
 except ValidationError:
     print(
         "Please set the required environment variables: "
@@ -365,9 +365,12 @@ class Page(Document):
 
     @property
     def descendants(self) -> list[int]:
-        url = f"rest/api/content/{self.id}/descendant/page"
+        # Use CQL search instead of descendant endpoint due to a bug in Confluence 8.5.20
+        # that causes HTTP 500 errors when using the descendant endpoint
+        url = "rest/api/search"
+        cql_query = f"ancestor={self.id} AND type=page"
         try:
-            response = cast(JsonResponse, confluence.get(url, params={"limit": 10000}))
+            response = cast(JsonResponse, confluence.get(url, params={"cql": cql_query, "limit": 10000}))
         except HTTPError as e:
             if e.response.status_code == 404:  # noqa: PLR2004
                 # Raise ApiError as the documented reason is ambiguous
@@ -379,7 +382,8 @@ class Page(Document):
 
             raise
 
-        return [page.get("id") for page in response.get("results", [])]
+        # The search API returns results with a different structure than the descendant endpoint
+        return [page.get("content", {}).get("id") for page in response.get("results", [])]
 
     @property
     def _template_vars(self) -> dict[str, str]:
