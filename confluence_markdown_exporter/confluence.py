@@ -89,10 +89,10 @@ class ConverterSettings(BaseSettings):
         ),
     )
     attachment_path: str = Field(
-        default="{space_name}/attachments/{attachment_file_id}{attachment_extension}",
+        default="{space_name}/attachments/{attachment_id}-{attachment_title}{attachment_extension}",
         description=(
             "Path to store attachments. Default: \n"
-            "  {space_name}/attachments/{attachment_file_id}{attachment_extension}\n"
+            "  {space_name}/attachments/{attachment_id}-{attachment_title}{attachment_extension}\n"
             "Variables:\n"
             "  {space_key}           - Space key\n"
             "  {space_name}          - Space name\n"
