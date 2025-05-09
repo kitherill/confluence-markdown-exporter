@@ -21,6 +21,7 @@ from atlassian import Confluence as ConfluenceApi
 from atlassian import Jira
 from atlassian.errors import ApiError
 from bs4 import BeautifulSoup
+from bs4 import NavigableString
 from bs4 import Tag
 from markdownify import ATX
 from markdownify import MarkdownConverter
@@ -466,8 +467,9 @@ class Page(Document):
                 attachment.export(export_path)
                 continue
 
-    def get_attachment_by_file_id(self, file_id: str) -> Attachment:
-        return next(attachment for attachment in self.attachments if attachment.file_id == file_id)
+
+    def get_attachment_by_file_id(self, id: str) -> Attachment:
+        return next(attachment for attachment in self.attachments if attachment.id == id)
 
     def get_attachments_by_title(self, title: str) -> list[Attachment]:
         return [attachment for attachment in self.attachments if attachment.title == title]
@@ -743,19 +745,22 @@ class Page(Document):
             if "page" in str(el.get("data-linked-resource-type")):
                 page_id = str(el.get("data-linked-resource-id", ""))
                 if page_id and page_id != "null":
-                    return self.convert_page_link(int(page_id))
+                    return self.convert_page_link(int(page_id), el)
             if "attachment" in str(el.get("data-linked-resource-type")):
                 return self.convert_attachment_link(el, text, parent_tags)
             if match := re.search(r"/wiki/.+?/pages/(\d+)", str(el.get("href", ""))):
                 page_id = match.group(1)
-                return self.convert_page_link(int(page_id))
+                return self.convert_page_link(int(page_id), el)
+            if match := re.search(r"/pages/viewpage.action\?pageId=(\d+)", str(el.get("href", ""))):
+                page_id = match.group(1)
+                return self.convert_page_link(int(page_id), el)
             if str(el.get("href", "")).startswith("#"):
                 # Handle heading links
                 return f"[{text}](#{sanitize_key(text, '-')})"
 
             return super().convert_a(el, text, parent_tags)
 
-        def convert_page_link(self, page_id: int) -> str:
+        def convert_page_link(self, page_id: int, el: BeautifulSoup = None) -> str:
             if not page_id:
                 msg = "Page link does not have valid page_id."
                 raise ValueError(msg)
@@ -763,7 +768,19 @@ class Page(Document):
             page = Page.from_id(page_id)
             relpath = os.path.relpath(page.export_path, self.page.export_path.parent)
 
-            return f"[{page.title}]({relpath.replace(' ', '%20')})"
+            link_content = page.title
+            if el is not None:
+                children = list(el.children)
+                if children:
+                    # Check if first child is a NavigableString (text node)
+                    if isinstance(children[0], NavigableString):
+                        link_content = children[0]
+                    else:
+                        link_content = self.process_tag(children[0], ["a"])
+                else:
+                    link_content = el.string
+
+            return f"[{link_content}]({relpath.replace(' ', '%20')})"
 
         def convert_attachment_link(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
@@ -795,10 +812,13 @@ class Page(Document):
 
         def convert_img(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             file_id = el.get("data-media-id")
-            if not file_id:
+            if file_id:
+                attachment = self.page.get_attachment_by_file_id(str(file_id))
+            else:
+                id = el.get("data-linked-resource-id")
+                attachment = self.page.get_attachment_by_file_id(str(id))
                 return ""
 
-            attachment = self.page.get_attachment_by_file_id(str(file_id))
             relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
             el["src"] = relpath.replace(" ", "%20")
             if "_inline" in parent_tags:
