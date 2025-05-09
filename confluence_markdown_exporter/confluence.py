@@ -15,6 +15,7 @@ from string import Template
 from typing import Literal
 from typing import TypeAlias
 from typing import cast
+from typing import Optional
 
 import yaml
 from atlassian import Confluence as ConfluenceApi
@@ -756,6 +757,14 @@ class Page(Document):
             if match := re.search(r"/pages/viewpage.action\?pageId=(\d+)", str(el.get("href", ""))):
                 page_id = match.group(1)
                 return self.convert_page_link(int(page_id), el)
+            if match := re.search(r"/display/(\w+)/([^/]+)(?:\+|$)", str(el.get("href", ""))):
+                space_key = match.group(1)
+                page_name = match.group(2).replace("+", " ")
+                page_id = get_page_id_by_space_and_name(space_key, page_name)
+                if page_id:
+                    return self.convert_page_link(int(page_id), el)
+                # Fallback to default link handling if page not found
+                return f"[{text}]({el.get('href', '')})"
             if str(el.get("href", "")).startswith("#"):
                 # Handle heading links
                 return f"[{text}](#{sanitize_key(text, '-')})"
@@ -907,3 +916,30 @@ def export_pages(page_ids: list[int], output_path: StrPath) -> None:
     for page_id in (pbar := tqdm(page_ids, smoothing=0.05)):
         pbar.set_postfix_str(f"Exporting page {page_id}")
         export_page(page_id, output_path)
+
+
+@functools.lru_cache(maxsize=10000)
+def get_page_id_by_space_and_name(space_key: str, page_name: str) -> Optional[int]:
+    """Get a page ID by space key and page name.
+
+    Args:
+        space_key: The key of the space containing the page
+        page_name: The page name/title to look for
+
+    Returns:
+        Page ID if found, None otherwise
+    """
+    try:
+        # Search for content using CQL (Confluence Query Language)
+        results = confluence.cql(
+            f'space.key="{space_key}" AND type=page AND title="{page_name}"',
+            limit=1
+        )
+
+        if results and results.get("results") and len(results["results"]) > 0:
+            return int(results["results"][0]["content"]["id"])
+        return None
+    except Exception as e:
+        if DEBUG:
+            print(f"Error finding page by name: {e}")
+        return None
