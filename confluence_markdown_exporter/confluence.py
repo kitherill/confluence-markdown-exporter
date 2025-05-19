@@ -9,6 +9,8 @@ import os
 import re
 import sys
 import copy
+import base64
+import hashlib
 from collections.abc import Set
 from os import PathLike
 from pathlib import Path
@@ -855,6 +857,51 @@ class Page(Document):
             if src:
                 # Get the global output path
                 output_path = Path(converter_settings.output_root_path)
+                
+                # Check if this is an inline base64 image
+                if src.startswith("data:"):
+                    try:
+                        # Parse the mime type and base64 data
+                        mime_type_match = re.match(r"data:([^;]+);base64,(.+)", src)
+                        if mime_type_match:
+                            mime_type = mime_type_match.group(1)
+                            base64_data = mime_type_match.group(2)
+                            
+                            # Determine file extension from mime type
+                            extension = mimetypes.guess_extension(mime_type) or ".bin"
+                            
+                            # Hash the base64 data
+                            data_hash = hashlib.md5(base64_data.encode()).hexdigest()
+                            
+                            # Create base64 directory if it doesn't exist
+                            base64_dir = output_path / "base64"
+                            base64_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Set the file path
+                            file_path = base64_dir / f"{data_hash}{extension}"
+                            
+                            # Save the file if it doesn't exist
+                            if not file_path.exists():
+                                try:
+                                    # Decode and save the file
+                                    image_data = base64.b64decode(base64_data)
+                                    save_file(file_path, image_data)
+                                except Exception as e:
+                                    if DEBUG:
+                                        print(f"Error saving base64 image: {e}")
+                                    return ""
+                            
+                            # Update src to point to local file - use relative path from page export location
+                            rel_img_path = os.path.relpath(file_path, output_path / self.page.export_path.parent)
+                            cloned_el = copy.copy(el)
+                            cloned_el["src"] = rel_img_path.replace(" ", "%20")
+                            if "_inline" in parent_tags:
+                                parent_tags.remove("_inline")  # Always show images.
+                            return super().convert_img(cloned_el, text, parent_tags)
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"Error processing base64 image: {e}")
+                        return ""
                 
                 # Place assets at the top level of the export directory
                 assets_dir = output_path / "assets"
