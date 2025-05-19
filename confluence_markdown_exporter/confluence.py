@@ -115,7 +115,7 @@ try:
 except ValidationError:
     print(
         "Please set the required environment variables: "
-        "ATLASSIAN_URL and either both ATLASSIAN_USERNAME and ATLASSIAN_API_TOKEN"
+        "ATLASSIAN_URL and either both ATLASSIAN_USERNAME and ATLASSIAN_API_TOKEN "
         "or ATLASSIAN_PAT\n\n"
         "Read the README.md for more information."
     )
@@ -468,6 +468,21 @@ class Page(Document):
                 attachment.export(export_path)
                 continue
 
+    def get_attachment_from_element(self, el: Tag) -> Attachment:
+        file_id = el.get("data-media-id")
+        if file_id:
+            attachment = self.page.get_attachment_by_file_id(str(file_id))
+        else:
+            id = el.get("data-linked-resource-id")
+            container_id = el.get("data-linked-resource-container-id")
+            if not id or not container_id:
+                return ""
+            image_container_page = Page.from_id(str(container_id))
+            if not image_container_page:
+                return ""
+            attachment = image_container_page.get_attachment_by_id(str(id))
+        return attachment
+
     def get_attachment_by_id(self, id: str) -> Attachment:
         return next(attachment for attachment in self.attachments if attachment.id == id)
 
@@ -796,8 +811,7 @@ class Page(Document):
         def convert_attachment_link(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
         ) -> str:
-            attachment_id = el.get("data-media-id")
-            attachment = self.page.get_attachment_by_file_id(str(attachment_id))
+            attachment = self.get_attachment_from_element(el)
             relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
             return f"[{attachment.title}]({relpath.replace(' ', '%20')})"
 
@@ -822,18 +836,9 @@ class Page(Document):
             return md
 
         def convert_img(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-            file_id = el.get("data-media-id")
-            if file_id:
-                attachment = self.page.get_attachment_by_file_id(str(file_id))
-            else:
-                id = el.get("data-linked-resource-id")
-                container_id = el.get("data-linked-resource-container-id")
-                if not id or not container_id:
-                    return ""
-                image_container_page = Page.from_id(str(container_id))
-                if not image_container_page:
-                    return ""
-                attachment = image_container_page.get_attachment_by_id(str(id))
+            attachment = self.get_attachment_from_element(el)
+            if not attachment:
+                return ""
 
             relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
             el["src"] = relpath.replace(" ", "%20")
