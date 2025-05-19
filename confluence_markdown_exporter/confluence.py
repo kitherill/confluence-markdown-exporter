@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import sys
+import copy
 from collections.abc import Set
 from os import PathLike
 from pathlib import Path
@@ -107,6 +108,10 @@ class ConverterSettings(BaseSettings):
             "  {attachment_file_id}  - Attachment file ID\n"
             "  {attachment_extension} - Attachment file extension (including leading dot)"
         ),
+    )
+    output_root_path: StrPath = Field(
+        default=".",
+        description="Root path for exported files, used for assets and other global exports",
     )
 
 
@@ -811,7 +816,7 @@ class Page(Document):
         def convert_attachment_link(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
         ) -> str:
-            attachment = self.get_attachment_from_element(el)
+            attachment = self.page.get_attachment_from_element(el)
             relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
             return f"[{attachment.title}]({relpath.replace(' ', '%20')})"
 
@@ -836,17 +841,55 @@ class Page(Document):
             return md
 
         def convert_img(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-            attachment = self.get_attachment_from_element(el)
-            if not attachment:
-                return ""
-
-            relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
-            el["src"] = relpath.replace(" ", "%20")
-            if "_inline" in parent_tags:
-                parent_tags.remove("_inline")  # Always show images.
-            return super().convert_img(el, text, parent_tags)
-            # REPORT Wiki style image link has alignment issues
-            # return f"![[{attachment.export_path}]]"
+            # First try to get attachment from the element
+            attachment = self.page.get_attachment_from_element(el)
+            if attachment:
+                relpath = os.path.relpath(attachment.export_path, self.page.export_path.parent)
+                el["src"] = relpath.replace(" ", "%20")
+                if "_inline" in parent_tags:
+                    parent_tags.remove("_inline")  # Always show images.
+                return super().convert_img(el, text, parent_tags)
+            
+            # Handle direct image URLs (emoticons, etc.)
+            src = el.get("src", "")
+            if src:
+                # Get the global output path
+                output_path = Path(converter_settings.output_root_path)
+                
+                # Place assets at the top level of the export directory
+                assets_dir = output_path / "assets"
+                
+                # Keep the full relative path as is
+                rel_path = src.lstrip("/")  # Remove leading slash, but preserve the entire path
+                
+                # Ensure the target directory exists
+                file_path = assets_dir / rel_path
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Check if file already exists (caching)
+                if not file_path.exists():
+                    try:
+                        # Download the file
+                        url = confluence.url + src if src.startswith("/") else src
+                        response = confluence._session.get(url)
+                        response.raise_for_status()
+                        
+                        # Save the file
+                        save_file(file_path, response.content)
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"Error downloading image from {src}: {e}")
+                        return ""
+                
+                # Update src to point to local file - use relative path from page export location
+                rel_img_path = os.path.relpath(file_path, output_path / self.page.export_path.parent)
+                cloned_el = copy.copy(el)
+                cloned_el["src"] = rel_img_path.replace(" ", "%20")
+                if "_inline" in parent_tags:
+                    parent_tags.remove("_inline")  # Always show images.
+                return super().convert_img(cloned_el, text, parent_tags)
+            
+            return ""
 
         def convert_drawio(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             if match := re.search(r"\|diagramName=(.+?)\|", str(el)):
@@ -907,6 +950,9 @@ def export_page(page_id: int, output_path: StrPath) -> None:
         page_id: The page id.
         output_path: The output path.
     """
+    # Set the global output path
+    converter_settings.output_root_path = output_path
+    
     page = Page.from_id(page_id)
     page.export(output_path)
 
@@ -918,6 +964,9 @@ def export_pages(page_ids: list[int], output_path: StrPath) -> None:
         page_ids: List of pages to export.
         output_path: The output path.
     """
+    # Set the global output path
+    converter_settings.output_root_path = output_path
+    
     for page_id in (pbar := tqdm(page_ids, smoothing=0.05)):
         pbar.set_postfix_str(f"Exporting page {page_id}")
         export_page(page_id, output_path)
