@@ -10,6 +10,7 @@ import re
 import sys
 import copy
 import base64
+import requests
 import hashlib
 from collections.abc import Set
 from os import PathLike
@@ -19,6 +20,7 @@ from typing import Literal
 from typing import TypeAlias
 from typing import cast
 from typing import Optional
+from urllib.parse import urlparse
 
 import yaml
 from atlassian import Confluence as ConfluenceApi
@@ -31,8 +33,8 @@ from markdownify import ATX
 from markdownify import MarkdownConverter
 from pydantic import BaseModel
 from pydantic import Field
-from pydantic import ValidationError
 from pydantic import model_validator
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 from requests import HTTPError
@@ -138,8 +140,19 @@ else:
         "password": api_settings.atlassian_api_token,
     }
 
-confluence = ConfluenceApi(url=api_settings.atlassian_url, **auth_args)
-jira = Jira(url=api_settings.atlassian_url, **auth_args)
+confluence = ConfluenceApi(url=api_settings.atlassian_url, timeout=360, **auth_args)
+
+# If JIRA_PAT_TOKEN env var is specified, override the auth args for jira client
+jira_pat_token = os.getenv("JIRA_PAT_TOKEN")
+if jira_pat_token:
+    jira_auth_args = {"token": jira_pat_token}
+else:
+    jira_auth_args = auth_args
+
+# Use JIRA_URL if specified, otherwise use the same Atlassian URL as Confluence
+jira_url = os.getenv("JIRA_URL") or api_settings.atlassian_url
+
+jira = Jira(url=jira_url, timeout=360, **jira_auth_args)
 
 
 class JiraIssue(BaseModel):
@@ -229,15 +242,31 @@ class Space(BaseModel):
     key: str
     name: str
     description: str
-    homepage: int
+    homepage: Optional[int] = None
 
     @property
     def pages(self) -> list[int]:
+        if self.homepage is None:
+            return []
         homepage = Page.from_id(self.homepage)
         return [self.homepage, *homepage.descendants]
 
     def export(self, export_path: StrPath) -> None:
-        export_pages(self.pages, export_path)
+        # Get all pages
+        all_pages = self.pages
+        
+        start_page = '300548538'
+        try:
+            start_index = all_pages.index(start_page)
+            # Use only the pages starting from the target ID
+            pages_to_export = all_pages[start_index:]
+            print(f"Resuming export from page ID {start_page}. {len(pages_to_export)} pages to process.")
+        except ValueError:
+            # If the target page ID is not found, process all pages
+            pages_to_export = all_pages
+            print(f"Page ID {start_page} not found. Processing all {len(pages_to_export)} pages.")
+            
+        export_pages(pages_to_export, export_path)
 
     @classmethod
     def from_json(cls, data: JsonResponse) -> "Space":
@@ -278,8 +307,8 @@ class Document(BaseModel):
         return {
             "space_key": sanitize_filename(self.space.key),
             "space_name": sanitize_filename(self.space.name),
-            "homepage_id": str(self.space.homepage),
-            "homepage_title": sanitize_filename(Page.from_id(self.space.homepage).title),
+            "homepage_id": str(self.space.homepage) if self.space.homepage is not None else "",
+            "homepage_title": sanitize_filename(Page.from_id(self.space.homepage).title) if self.space.homepage is not None else "",
             "ancestor_ids": "/".join(str(a) for a in self.ancestors),
             "ancestor_titles": "/".join(
                 sanitize_filename(Page.from_id(a).title) for a in self.ancestors
@@ -355,7 +384,7 @@ class Attachment(Document):
             response = confluence._session.get(str(confluence.url + self.download_link))
             response.raise_for_status()  # Raise error if request fails
         except HTTPError:
-            print(f"There is no attachment with titel '{self.title}'. Skipping export.")
+            print(f"There is no attachment with title '{self.title}'. Skipping export.")
             return
 
         save_file(
@@ -857,6 +886,9 @@ class Page(Document):
             if src:
                 # Get the global output path
                 output_path = Path(converter_settings.output_root_path)
+
+                assets_dir = output_path / "assets"
+                assets_dir.mkdir(parents=True, exist_ok=True)
                 
                 # Check if this is an inline base64 image
                 if src.startswith("data:"):
@@ -873,12 +905,8 @@ class Page(Document):
                             # Hash the base64 data
                             data_hash = hashlib.md5(base64_data.encode()).hexdigest()
                             
-                            # Create base64 directory if it doesn't exist
-                            base64_dir = output_path / "base64"
-                            base64_dir.mkdir(parents=True, exist_ok=True)
-                            
                             # Set the file path
-                            file_path = base64_dir / f"{data_hash}{extension}"
+                            file_path = assets_dir / f"{data_hash}{extension}"
                             
                             # Save the file if it doesn't exist
                             if not file_path.exists():
@@ -903,23 +931,60 @@ class Page(Document):
                             print(f"Error processing base64 image: {e}")
                         return ""
                 
-                # Place assets at the top level of the export directory
-                assets_dir = output_path / "assets"
+                # Calculate a hash from the original src value
+                src_hash = hashlib.md5(src.encode()).hexdigest()
                 
-                # Keep the full relative path as is
-                rel_path = src.lstrip("/")  # Remove leading slash, but preserve the entire path
+                # Look for existing files with this hash (any extension)
+                existing_files = list(assets_dir.glob(f"{src_hash}.*"))
                 
-                # Ensure the target directory exists
-                file_path = assets_dir / rel_path
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Check if file already exists (caching)
-                if not file_path.exists():
+                if existing_files:
+                    # Use the first existing file with this hash
+                    file_path = existing_files[0]
+                else:
+                    # File not found, download it
                     try:
                         # Download the file
                         url = confluence.url + src if src.startswith("/") else src
-                        response = confluence._session.get(url)
-                        response.raise_for_status()
+                        parsed_url = urlparse(url)
+                        if parsed_url.netloc.startswith('jira'):
+                            # Use standard HTTP client with Jira cookie for Jira URLs
+                            jira_cookie = os.environ.get('JIRA_COOKIE')
+                            headers = {'Cookie': jira_cookie} if jira_cookie else {}
+                            response = requests.get(url, headers=headers)
+                            response.raise_for_status()
+                            
+                            # Check if response is HTML (consider it failed request)
+                            content_type = response.headers.get('Content-Type', '')
+                            if 'text/html' in content_type.lower():
+                                if DEBUG:
+                                    print(f"Error: Jira URL {url} returned HTML response instead of an image")
+                                raise Exception("HTML response received instead of an image")
+                        else:
+                            # Use existing confluence session for other URLs
+                            response = confluence._session.get(url)
+                            response.raise_for_status()
+                        
+                        # Determine file extension from response content type
+                        content_type = response.headers.get('Content-Type', '')
+                        extension = mimetypes.guess_extension(content_type) or '.bin'
+                        
+                        # If extension wasn't resolved, try to extract it from the URL
+                        if extension == '.bin':
+                            # Extract extension from URL if present
+                            url_path = urlparse(url).path
+                            url_extension = os.path.splitext(url_path)[1].lower()
+                            
+                            # List of known image extensions
+                            known_image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.bmp', '.tiff', '.ico']
+                            
+                            if url_extension and url_extension in known_image_extensions:
+                                extension = url_extension
+                            else:
+                                # Log error if extension couldn't be resolved
+                                print(f"Error: Could not determine file extension for {url}. Using .bin")
+                        
+                        # Set file path with hash and extension
+                        file_path = assets_dir / f"{src_hash}{extension}"
                         
                         # Save the file
                         save_file(file_path, response.content)
