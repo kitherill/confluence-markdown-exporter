@@ -17,11 +17,13 @@ import json
 from collections.abc import Set
 from os import PathLike
 from pathlib import Path
+from requests.adapters import HTTPAdapter
 from string import Template
 from typing import Literal
 from typing import TypeAlias
 from typing import cast
 from typing import Optional
+from urllib3.util.retry import Retry
 from urllib.parse import urlparse
 
 import yaml
@@ -134,27 +136,32 @@ except ValidationError:
 
 converter_settings = ConverterSettings()
 
+retries = Retry(total=10, backoff_factor=2, backoff_max=60, status_forcelist=[502, 503, 504])
+adapter = HTTPAdapter(max_retries=retries)
+confluenceSession = requests.Session()
+confluenceSession.mount('http://', adapter)
+confluenceSession.mount('https://', adapter)
 if api_settings.atlassian_pat:
-    auth_args = {"token": api_settings.atlassian_pat}
+    confluenceSession.headers.update({"Authorization": f"Bearer {api_settings.atlassian_pat}"})
 else:
-    auth_args = {
-        "username": api_settings.atlassian_username,
-        "password": api_settings.atlassian_api_token,
-    }
+    confluenceSession.headers.update({"Authorization": f"Basic {base64.b64encode(f'{api_settings.atlassian_username}:{api_settings.atlassian_api_token}'.encode()).decode()}"})
 
-confluence = ConfluenceApi(url=api_settings.atlassian_url, timeout=360, **auth_args)
+confluence = ConfluenceApi(url=api_settings.atlassian_url, session=confluenceSession, timeout=360)
 
 # If JIRA_PAT_TOKEN env var is specified, override the auth args for jira client
-jira_pat_token = os.getenv("JIRA_PAT_TOKEN")
+jira_pat_token = os.getenv("JIRA_PAT")
+jiraSession = requests.Session()
+jiraSession.mount('http://', adapter)
+jiraSession.mount('https://', adapter)
 if jira_pat_token:
-    jira_auth_args = {"token": jira_pat_token}
+    jiraSession.headers.update({"Authorization": f"Bearer {jira_pat_token}"})
 else:
-    jira_auth_args = auth_args
+    jiraSession.headers.update({"Authorization": f"Basic {base64.b64encode(f'{api_settings.atlassian_username}:{api_settings.atlassian_api_token}'.encode()).decode()}"})
 
 # Use JIRA_URL if specified, otherwise use the same Atlassian URL as Confluence
 jira_url = os.getenv("JIRA_URL") or api_settings.atlassian_url
 
-jira = Jira(url=jira_url, timeout=360, **jira_auth_args)
+jira = Jira(url=jira_url, session=confluenceSession, timeout=360)
 
 
 class JiraIssue(BaseModel):
