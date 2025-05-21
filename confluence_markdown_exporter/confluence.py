@@ -4,6 +4,7 @@ https://developer.atlassian.com/cloud/confluence/rest/v1/intro
 """
 
 import functools
+from math import e
 import mimetypes
 import os
 import re
@@ -12,6 +13,7 @@ import copy
 import base64
 import requests
 import hashlib
+import json
 from collections.abc import Set
 from os import PathLike
 from pathlib import Path
@@ -248,25 +250,59 @@ class Space(BaseModel):
     def pages(self) -> list[int]:
         if self.homepage is None:
             return []
-        homepage = Page.from_id(self.homepage)
-        return [self.homepage, *homepage.descendants]
+        
+        # Implement paginated fetching of pages
+        all_pages = []
+        
+        # Get the page generator
+        page_generator = confluence.get_all_pages_from_space_as_generator(
+            self.key, 
+            limit=200,
+            expand=None
+        )
+        
+        # Now iterate over each page in the generator
+        for page in page_generator:
+            # Process individual page here
+            page_id = int(page["id"])
+            all_pages.append(page_id)
+        
+        # Return homepage and all descendants
+        return all_pages
 
     def export(self, export_path: StrPath) -> None:
-        # Get all pages
-        all_pages = self.pages
+        # Define cache file path for storing page IDs
+        output_path = Path(export_path)
+        cache_dir = output_path / ".cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = cache_dir / "pages.txt"
         
-        start_page = '300548538'
-        try:
-            start_index = all_pages.index(start_page)
-            # Use only the pages starting from the target ID
-            pages_to_export = all_pages[start_index:]
-            print(f"Resuming export from page ID {start_page}. {len(pages_to_export)} pages to process.")
-        except ValueError:
-            # If the target page ID is not found, process all pages
-            pages_to_export = all_pages
-            print(f"Page ID {start_page} not found. Processing all {len(pages_to_export)} pages.")
-            
-        export_pages(pages_to_export, export_path)
+        # Check if cache file exists
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    all_pages = [line.strip() for line in f if line.strip()]
+                print(f"Loaded {len(all_pages)} page IDs from cache file for space {self.key}")
+            except Exception as e:
+                print(f"Error loading cached page IDs: {e}")
+                # Fallback to fetching pages
+                all_pages = self.pages
+                # Save fetched pages to cache
+                with open(cache_file, "w") as f:
+                    for page_id in all_pages:
+                        f.write(f"{page_id}\n")
+        else:
+            # Fetch pages and save to cache
+            all_pages = self.pages
+            try:
+                with open(cache_file, "w") as f:
+                    for page_id in all_pages:
+                        f.write(f"{page_id}\n")
+                print(f"Saved {len(all_pages)} page IDs to cache file")
+            except Exception as e:
+                print(f"Error saving page IDs to cache: {e}")
+        
+        export_pages(all_pages, export_path)
 
     @classmethod
     def from_json(cls, data: JsonResponse) -> "Space":
@@ -311,9 +347,22 @@ class Document(BaseModel):
             "homepage_title": sanitize_filename(Page.from_id(self.space.homepage).title) if self.space.homepage is not None else "",
             "ancestor_ids": "/".join(str(a) for a in self.ancestors),
             "ancestor_titles": "/".join(
-                sanitize_filename(Page.from_id(a).title) for a in self.ancestors
-            ),
+                sanitize_filename(self._get_safe_ancestor_title(a)) for a in self.ancestors
+            )
         }
+
+    def _get_safe_ancestor_title(self, ancestor_id: int) -> str:
+        """Get the title of an ancestor page safely, returning 'N/A' if the page cannot be accessed.
+        
+        This specifically handles 403 Forbidden errors which may occur when a page is a draft
+        or outside the Personal Access Token scope.
+        """
+        try:
+            return Page.from_id(ancestor_id).title
+        except HTTPError as e:
+            if e.response.status_code == 403:
+                return "N/A"
+            raise  # Re-raise other HTTP errors
 
 
 class Attachment(Document):
@@ -1079,9 +1128,38 @@ def export_pages(page_ids: list[int], output_path: StrPath) -> None:
     # Set the global output path
     converter_settings.output_root_path = output_path
     
-    for page_id in (pbar := tqdm(page_ids, smoothing=0.05)):
+    # Create cache directory if it doesn't exist
+    output_path_obj = Path(output_path)
+    cache_dir = output_path_obj / ".cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    processed_pages_file = cache_dir / "processed_pages.txt"
+    
+    # Read the list of already processed pages
+    processed_pages = set()
+    if processed_pages_file.exists():
+        try:
+            with open(processed_pages_file, "r") as f:
+                processed_pages = {line.strip() for line in f}
+            print(f"Found {len(processed_pages)} previously processed pages")
+        except Exception as e:
+            print(f"Error reading processed pages file: {e}")
+    
+    # Filter out already processed pages
+    pages_to_process = [page_id for page_id in page_ids if page_id not in processed_pages]
+    if len(pages_to_process) < len(page_ids):
+        print(f"Skipping {len(page_ids) - len(pages_to_process)} already processed pages")
+    
+    # Process remaining pages
+    for page_id in (pbar := tqdm(pages_to_process, smoothing=0.05)):
         pbar.set_postfix_str(f"Exporting page {page_id}")
-        export_page(page_id, output_path)
+        try:
+            export_page(page_id, output_path)
+            
+            # Append the processed page ID to the file
+            with open(processed_pages_file, "a") as f:
+                f.write(f"{page_id}\n")
+        except Exception as e:
+            print(f"Error exporting page {page_id}: {e}")
 
 
 @functools.lru_cache(maxsize=10000)
