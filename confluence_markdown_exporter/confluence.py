@@ -113,7 +113,7 @@ try:
 except ValidationError:
     print(
         "Please set the required environment variables: "
-        "ATLASSIAN_URL and either both ATLASSIAN_USERNAME and ATLASSIAN_API_TOKEN"
+        "ATLASSIAN_URL and either both ATLASSIAN_USERNAME and ATLASSIAN_API_TOKEN "
         "or ATLASSIAN_PAT\n\n"
         "Read the README.md for more information."
     )
@@ -960,7 +960,7 @@ class Page(Document):
                     try:
                         # Download the file
                         url = confluence.url + src if src.startswith("/") else src
-                        
+
                         # Use existing confluence session for other URLs
                         response = confluence._session.get(url)
                         response.raise_for_status()
