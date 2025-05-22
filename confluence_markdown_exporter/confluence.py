@@ -13,7 +13,6 @@ import copy
 import base64
 import requests
 import hashlib
-import json
 from collections.abc import Set
 from os import PathLike
 from pathlib import Path
@@ -25,6 +24,8 @@ from typing import cast
 from typing import Optional
 from urllib3.util.retry import Retry
 from urllib.parse import urlparse
+
+import logging
 
 import yaml
 from atlassian import Confluence as ConfluenceApi
@@ -54,6 +55,18 @@ StrPath: TypeAlias = str | PathLike[str]
 
 DEBUG: bool = bool(os.getenv("DEBUG"))
 
+# In-memory cache for page IDs
+# Format: {export_path: {(space_key, page_title): page_id}}
+_PAGE_ID_CACHE = {}
+
+# Configure logger
+# logger = logging.getLogger("confluence_api")
+# if DEBUG:
+#     logging.basicConfig(level=logging.DEBUG)
+#     logger.setLevel(logging.DEBUG)
+# else:
+#     logging.basicConfig(level=logging.INFO)
+#     logger.setLevel(logging.INFO)
 
 class ApiSettings(BaseSettings):
     atlassian_username: str | None = Field(default=None)
@@ -136,11 +149,20 @@ except ValidationError:
 
 converter_settings = ConverterSettings()
 
+def response_hook(response, *args, **kwargs):
+    """Log response headers when requests fail."""
+    if not response.ok:
+        print(f"Request to {response.url} failed with status {response.status_code}")
+        print(f"Response headers: {dict(response.headers)}")
+    return response
+
 retries = Retry(total=10, backoff_factor=2, backoff_max=60, status_forcelist=[502, 503, 504])
 adapter = HTTPAdapter(max_retries=retries)
 confluenceSession = requests.Session()
 confluenceSession.mount('http://', adapter)
 confluenceSession.mount('https://', adapter)
+# Add response hook to log headers on failure
+confluenceSession.hooks['response'] = [response_hook]
 if api_settings.atlassian_pat:
     confluenceSession.headers.update({"Authorization": f"Bearer {api_settings.atlassian_pat}"})
 else:
@@ -153,6 +175,7 @@ jira_pat_token = os.getenv("JIRA_PAT")
 jiraSession = requests.Session()
 jiraSession.mount('http://', adapter)
 jiraSession.mount('https://', adapter)
+jiraSession.hooks['response'] = [response_hook]
 if jira_pat_token:
     jiraSession.headers.update({"Authorization": f"Bearer {jira_pat_token}"})
 else:
@@ -161,7 +184,7 @@ else:
 # Use JIRA_URL if specified, otherwise use the same Atlassian URL as Confluence
 jira_url = os.getenv("JIRA_URL") or api_settings.atlassian_url
 
-jira = Jira(url=jira_url, session=confluenceSession, timeout=360)
+jira = Jira(url=jira_url, session=jiraSession, timeout=360)
 
 
 class JiraIssue(BaseModel):
@@ -352,10 +375,7 @@ class Document(BaseModel):
             "space_name": sanitize_filename(self.space.name),
             "homepage_id": str(self.space.homepage) if self.space.homepage is not None else "",
             "homepage_title": sanitize_filename(Page.from_id(self.space.homepage).title) if self.space.homepage is not None else "",
-            "ancestor_ids": "/".join(str(a) for a in self.ancestors),
-            "ancestor_titles": "/".join(
-                sanitize_filename(self._get_safe_ancestor_title(a)) for a in self.ancestors
-            )
+            "ancestor_ids": "/".join(str(a) for a in self.ancestors)
         }
 
     def _get_safe_ancestor_title(self, ancestor_id: int) -> str:
@@ -502,6 +522,7 @@ class Page(Document):
             case _:
                 msg = f"Invalid markdown style: {converter_settings.markdown_style}"
                 raise ValueError(msg)
+        return None
 
     @property
     def markdown(self) -> str:
@@ -512,6 +533,9 @@ class Page(Document):
             self.export_body(export_path)
         self.export_markdown(export_path)
         self.export_attachments(export_path)
+        
+        # Save page ID to cache
+        _save_page_id_to_cache(self.id, self.space.key, self.title, export_path)
 
     def export_with_descendants(self, export_path: StrPath) -> None:
         export_pages([self.id, *self.descendants], export_path)
@@ -586,12 +610,30 @@ class Page(Document):
 
     @classmethod
     def from_json(cls, data: JsonResponse) -> "Page":
-        attachments = cast(
-            JsonResponse,
-            confluence.get_attachments_from_content(
-                data.get("id", 0), limit=1000, expand="container.ancestors"
-            ),
-        )
+        # Get attachments with pagination (100 items per page)
+        attachments = []
+        start = 0
+        limit = 100
+        
+        while True:
+            attachments_page = cast(
+                JsonResponse,
+                confluence.get_attachments_from_content(
+                    data.get("id", 0), limit=limit, start=start
+                    # , expand="container.ancestors"
+                ),
+            )
+            
+            current_results = attachments_page.get("results", [])
+            attachments.extend(current_results)
+            
+            # Check if we've reached the end of the results
+            if len(current_results) < limit or "next" not in attachments_page.get("_links", {}):
+                break
+                
+            # Move to the next page
+            start += limit
+        
         return cls(
             id=data.get("id", 0),
             title=data.get("title", ""),
@@ -604,7 +646,7 @@ class Page(Document):
                 for label in data.get("metadata", {}).get("labels", {}).get("results", [])
             ],
             attachments=[
-                Attachment.from_json(attachment) for attachment in attachments.get("results", [])
+                Attachment.from_json(attachment) for attachment in attachments
             ],
             ancestors=[ancestor.get("id") for ancestor in data.get("ancestors", [])][1:],
         )
@@ -1016,6 +1058,11 @@ class Page(Document):
                                     print(f"Error: Jira URL {url} returned HTML response instead of an image")
                                 raise Exception("HTML response received instead of an image")
                         else:
+
+                            # TODO: remove - we're skipping this and handling this manually later.
+                            if url.startswith("http://confluence.dev.") or url.startswith("https://confluence.dev."):
+                                return ""
+
                             # Use existing confluence session for other URLs
                             response = confluence._session.get(url)
                             response.raise_for_status()
@@ -1111,6 +1158,100 @@ class Page(Document):
             return super().convert_table(table, "", parent_tags)  # type: ignore -
 
 
+def _get_page_id_cache_file(export_path: StrPath) -> Path:
+    """Get the path to the page ID cache file.
+    
+    Args:
+        export_path: The export directory path
+        
+    Returns:
+        Path to the cache file
+    """
+    path_obj = Path(export_path)
+    cache_dir = path_obj / ".cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir / "page_id_cache.txt"
+
+
+def _load_page_id_cache(export_path: StrPath) -> dict:
+    """Load the page ID cache for an export path.
+    
+    Args:
+        export_path: The export directory path
+    
+    Returns:
+        Dictionary with (space_key, page_title) as key and page_id as value
+    """
+    export_path_str = str(export_path)
+    
+    # Return existing cache if already loaded for this export path
+    if export_path_str in _PAGE_ID_CACHE:
+        return _PAGE_ID_CACHE[export_path_str]
+    
+    # Initialize new cache for this export path
+    cache = {}
+    _PAGE_ID_CACHE[export_path_str] = cache
+    
+    # Load cache from file if it exists
+    cache_file = _get_page_id_cache_file(export_path)
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        parts = line.split(":", 2)
+                        if len(parts) == 3:
+                            page_id, space_key, page_title = parts
+                            cache[(space_key, page_title)] = int(page_id)
+            
+            if DEBUG:
+                print(f"Loaded {len(cache)} page IDs from cache file")
+        except Exception as e:
+            if DEBUG:
+                print(f"Error loading page ID cache: {e}")
+    
+    return cache
+
+
+def _save_page_id_to_cache(page_id: int, space_key: str, page_title: str, export_path: StrPath) -> None:
+    """Save a page ID to the cache.
+    
+    Args:
+        page_id: The page ID to cache
+        space_key: The space key associated with the page
+        page_title: The page title
+        export_path: The export directory path
+    """
+    if not page_id or not space_key or not page_title:
+        return
+    
+    export_path_str = str(export_path)
+    cache_key = (space_key, page_title)
+    
+    # Load cache if not already loaded
+    if export_path_str not in _PAGE_ID_CACHE:
+        _load_page_id_cache(export_path)
+    
+    cache = _PAGE_ID_CACHE[export_path_str]
+    
+    # Skip if already in cache
+    if cache_key in cache and cache[cache_key] == page_id:
+        return
+    
+    # Add to in-memory cache
+    cache[cache_key] = page_id
+    
+    # Append to cache file
+    try:
+        cache_file = _get_page_id_cache_file(export_path)
+        with open(cache_file, "a") as f:
+            f.write(f"{page_id}:{space_key}:{page_title}\n")
+    except Exception as e:
+        if DEBUG:
+            print(f"Error saving to page ID cache: {e}")
+
+
 def export_page(page_id: int, output_path: StrPath) -> None:
     """Export a Confluence page to Markdown.
 
@@ -1123,6 +1264,9 @@ def export_page(page_id: int, output_path: StrPath) -> None:
     
     page = Page.from_id(page_id)
     page.export(output_path)
+    
+    # Save page ID to cache
+    _save_page_id_to_cache(page.id, page.space.key, page.title, output_path)
 
 
 def export_pages(page_ids: list[int], output_path: StrPath) -> None:
@@ -1180,7 +1324,21 @@ def get_page_id_by_space_and_name(space_key: str, page_name: str) -> Optional[in
     Returns:
         Page ID if found, None otherwise
     """
+    # Get the current output path from converter settings
+    export_path = getattr(converter_settings, "output_root_path", None)
+    
+    # Check cache if we have an export path
+    if export_path:
+        cache = _load_page_id_cache(export_path)
+        cache_key = (space_key, page_name)
+        if cache_key in cache:
+            return cache[cache_key]
+    
+    # Cache miss, make API call
     try:
+        if DEBUG:
+            print(f"Resolving page ID for space '{space_key}' and title '{page_name}'...")
+
         # Search for content using CQL (Confluence Query Language)
         results = confluence.cql(
             f'space.key="{space_key}" AND type=page AND title="{page_name}"',
@@ -1188,7 +1346,13 @@ def get_page_id_by_space_and_name(space_key: str, page_name: str) -> Optional[in
         )
 
         if results and results.get("results") and len(results["results"]) > 0:
-            return int(results["results"][0]["content"]["id"])
+            page_id = int(results["results"][0]["content"]["id"])
+            
+            # Save to cache if we have an export path
+            if export_path:
+                _save_page_id_to_cache(page_id, space_key, page_name, export_path)
+            
+            return page_id
         return None
     except Exception as e:
         if DEBUG:
